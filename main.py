@@ -1,11 +1,150 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import paramiko
 import threading
 import time
 import os
 import socket
-import select  # 添加 select 模块导入
+import select
+import json
+import logging
+from datetime import datetime
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,  # 设置为INFO级别，这样DEBUG信息不会显示
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),  # 输出到控制台
+    ],
+)
+
+
+class ConfigManager:
+    def __init__(self, config_path=None):
+        if config_path:
+            self.config_file = config_path
+            self.config_dir = os.path.dirname(config_path)
+        else:
+            self.config_dir = os.path.expanduser("./")
+            self.config_file = os.path.join(self.config_dir, "tunnels.json")
+        self.ensure_config_dir()
+
+    def set_config_path(self, config_path):
+        self.config_file = config_path
+        self.config_dir = os.path.dirname(config_path)
+        self.ensure_config_dir()
+
+    def ensure_config_dir(self):
+        if not os.path.exists(self.config_dir):
+            os.makedirs(self.config_dir)
+
+    def save_config(self, tunnels_config, tags_config):
+        config = {
+            "tunnels": tunnels_config,
+            "tags": tags_config,
+            "last_updated": datetime.now().isoformat(),
+        }
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"保存配置失败: {e}")
+            return False
+
+    def enable_debug_log(self):
+        """启用详细日志"""
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.info("已启用详细日志模式")
+        messagebox.showinfo("调试", "已启用详细日志模式\n现在会显示所有连接和线程操作")
+
+    def disable_debug_log(self):
+        """禁用详细日志"""
+        logging.getLogger().setLevel(logging.INFO)
+        logging.info("已禁用详细日志模式")
+        messagebox.showinfo("调试", "已禁用详细日志模式\n现在只显示重要操作信息")
+
+    def force_stop_selected_tunnel(self):
+        """强制停止选中的隧道"""
+        selection = self.tree.selection()
+        if not selection:
+            logging.warning("用户尝试强制停止隧道但未选择任何隧道")
+            messagebox.showwarning("警告", "请先选择要强制停止的隧道")
+            return
+
+        item = self.tree.item(selection[0])
+        tunnel_tag = item["tags"][0]
+        tunnel = next((t for t in self.tunnels if str(t.tunnel_id) == tunnel_tag), None)
+        if tunnel:
+            logging.info(f"用户请求强制停止隧道: '{tunnel.name}'")
+            if messagebox.askyesno(
+                "确认",
+                f"确定要强制停止隧道 '{tunnel.name}' 吗？\n这将立即终止所有相关连接。",
+            ):
+                self.force_stop_tunnel(tunnel)
+        else:
+            logging.error("无法找到选中的隧道对象")
+            messagebox.showerror("错误", "无法找到选中的隧道")
+
+    def force_stop_tunnel(self, tunnel):
+        """强制停止隧道，不等待线程结束"""
+        logging.info(
+            f"强制停止隧道: '{tunnel.name}' ({tunnel.hostname}:{tunnel.local_port}->{tunnel.remote_port})"
+        )
+
+        if tunnel not in self.tunnels:
+            logging.warning(f"隧道 '{tunnel.name}' 不在活动隧道列表中")
+            return
+
+        # 立即设置停止标志
+        tunnel.is_running = False
+
+        try:
+            # 强制关闭socket
+            if tunnel.server_socket:
+                try:
+                    tunnel.server_socket.shutdown(socket.SHUT_RDWR)
+                    tunnel.server_socket.close()
+                except:
+                    pass
+                tunnel.server_socket = None
+
+            # 强制关闭SSH连接
+            if tunnel.ssh:
+                try:
+                    transport = tunnel.ssh.get_transport()
+                    if transport:
+                        transport.close()
+                    tunnel.ssh.close()
+                except:
+                    pass
+                tunnel.ssh = None
+
+            # 立即从列表中移除
+            self.tunnels.remove(tunnel)
+            self.update_table()
+
+            logging.info(f"隧道 '{tunnel.name}' 已被强制停止")
+            messagebox.showinfo("完成", f"隧道 '{tunnel.name}' 已被强制停止")
+
+        except Exception as e:
+            logging.error(f"强制停止隧道 '{tunnel.name}' 时出错: {e}")
+            # 即使出错也从列表中移除
+            if tunnel in self.tunnels:
+                self.tunnels.remove(tunnel)
+                self.update_table()
+
+    def load_config(self):
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    return config.get("tunnels", []), config.get("tags", {})
+            return [], {}
+        except Exception as e:
+            print(f"加载配置失败: {e}")
+            return [], {}
 
 
 class CredentialsDialog:
@@ -15,6 +154,13 @@ class CredentialsDialog:
         self.dialog.geometry("300x200")
         self.dialog.transient(parent)
         self.dialog.grab_set()
+        self.dialog.resizable(False, False)
+
+        # 居中显示
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (self.dialog.winfo_width() // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (self.dialog.winfo_height() // 2)
+        self.dialog.geometry(f"+{x}+{y}")
 
         # 创建输入框和标签
         ttk.Label(self.dialog, text="Username:").grid(row=0, column=0, padx=5, pady=5)
@@ -32,11 +178,21 @@ class CredentialsDialog:
         self.port.grid(row=2, column=1, padx=5, pady=5)
 
         # 创建按钮
-        ttk.Button(self.dialog, text="Connect", command=self.connect).grid(
-            row=3, column=0, columnspan=2, pady=20
+        button_frame = ttk.Frame(self.dialog)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
+
+        ttk.Button(button_frame, text="Connect", command=self.connect).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(button_frame, text="Cancel", command=self.cancel).pack(
+            side=tk.LEFT, padx=5
         )
 
         self.result = None
+
+        # 绑定回车键
+        self.dialog.bind("<Return>", lambda e: self.connect())
+        self.dialog.bind("<Escape>", lambda e: self.cancel())
 
     def connect(self):
         try:
@@ -52,13 +208,20 @@ class CredentialsDialog:
         except ValueError as e:
             messagebox.showerror("Error", str(e))
 
+    def cancel(self):
+        self.result = None
+        self.dialog.destroy()
+
     def show(self):
+        self.username.focus()
         self.dialog.wait_window()
         return self.result
 
 
 class SSHTunnel:
-    def __init__(self, hostname, local_port, remote_port, root):
+    def __init__(
+        self, hostname, local_port, remote_port, root, tunnel_id=None, name=""
+    ):
         self.hostname = hostname
         self.local_port = local_port
         self.remote_port = remote_port
@@ -69,9 +232,13 @@ class SSHTunnel:
         self.thread = None
         self.server_socket = None
         self.accept_thread = None
-        self.forward_threads = []  # 跟踪所有转发线程
+        self.forward_threads = []
+        self.tunnel_id = tunnel_id or f"{hostname}:{local_port}->{remote_port}"
+        self.name = name or self.tunnel_id
+        self.start_time = None
 
     def _accept_connections(self):
+        logging.info(f"[{self.name}] 连接接受线程开始运行")
         while self.is_running:
             try:
                 # 设置超时以便定期检查运行状态
@@ -79,60 +246,121 @@ class SSHTunnel:
                 if not r:
                     continue
 
+                if not self.is_running:  # 双重检查
+                    break
+
                 client_socket, addr = self.server_socket.accept()
-                print(f"New connection from {addr}")
+                logging.debug(f"[{self.name}] 接受新连接: {addr}")
+
+                if (
+                    not self.ssh
+                    or not self.ssh.get_transport()
+                    or not self.ssh.get_transport().is_active()
+                ):
+                    logging.error(f"[{self.name}] SSH连接无效，拒绝客户端连接")
+                    client_socket.close()
+                    continue
 
                 channel = self.ssh.get_transport().open_channel(
                     "direct-tcpip",
-                    # ("127.0.0.1", self.remote_port),
-                    ("0.0.0.0", self.remote_port),
+                    # ("0.0.0.0", self.remote_port),
+                    ("127.0.0.1", self.remote_port),
                     (addr[0], client_socket.getsockname()[1]),
                 )
 
                 if not channel:
-                    print("Failed to create channel")
+                    logging.error(f"[{self.name}] 无法创建SSH通道")
                     client_socket.close()
                     continue
 
-                # 创建转发线程并记录
+                logging.debug(f"[{self.name}] 为连接 {addr} 创建转发线程")
                 forward_thread = threading.Thread(
-                    target=self._forward_data, args=(client_socket, channel)
+                    target=self._forward_data,
+                    args=(client_socket, channel),
+                    name=f"Forward-{self.name}-{addr[0]}:{addr[1]}",
                 )
                 forward_thread.daemon = True
                 forward_thread.start()
                 self.forward_threads.append(forward_thread)
 
+            except socket.error as e:
+                if self.is_running:
+                    logging.warning(f"[{self.name}] Socket错误: {e}")
+                else:
+                    break  # 隧道已关闭，正常退出
             except Exception as e:
                 if self.is_running:
-                    print(f"Accept error: {e}")
+                    logging.error(f"[{self.name}] 接受连接时出错: {e}")
                 else:
                     break  # 隧道已关闭，正常退出
 
+        logging.info(f"[{self.name}] 连接接受线程结束")
+
     def _forward_data(self, client_socket, channel):
+        """转发客户端socket和SSH通道之间的数据"""
+        connection_id = f"{client_socket.getpeername()}"
+        logging.debug(f"[{self.name}] 开始为连接 {connection_id} 转发数据")
+
         try:
             while self.is_running:
-                r, _, _ = select.select([client_socket, channel], [], [], 1.0)
-                if not self.is_running:  # 隧道已关闭
+                if not self.is_running:  # 双重检查
                     break
 
-                if client_socket in r:
-                    data = client_socket.recv(1024)
-                    if not data:
-                        break
-                    channel.send(data)
+                try:
+                    r, _, _ = select.select([client_socket, channel], [], [], 1.0)
+                    if not r:
+                        continue
 
-                if channel in r:
-                    data = channel.recv(1024)
-                    if not data:
+                    if not self.is_running:  # 隧道已关闭
                         break
-                    client_socket.send(data)
+
+                    if client_socket in r:
+                        try:
+                            data = client_socket.recv(1024)
+                            if not data:
+                                logging.debug(
+                                    f"[{self.name}] 客户端 {connection_id} 关闭连接"
+                                )
+                                break
+                            channel.send(data)
+                        except Exception as e:
+                            logging.debug(
+                                f"[{self.name}] 从客户端读取数据失败 {connection_id}: {e}"
+                            )
+                            break
+
+                    if channel in r:
+                        try:
+                            data = channel.recv(1024)
+                            if not data:
+                                logging.debug(
+                                    f"[{self.name}] SSH通道 {connection_id} 关闭"
+                                )
+                                break
+                            client_socket.send(data)
+                        except Exception as e:
+                            logging.debug(
+                                f"[{self.name}] 从SSH通道读取数据失败 {connection_id}: {e}"
+                            )
+                            break
+
+                except select.error as e:
+                    if self.is_running:
+                        logging.debug(f"[{self.name}] select错误 {connection_id}: {e}")
+                    break
+                except Exception as e:
+                    if self.is_running:
+                        logging.debug(
+                            f"[{self.name}] 转发数据时出错 {connection_id}: {e}"
+                        )
+                    break
 
         except Exception as e:
-            # 隧道关闭时的错误不显示
             if self.is_running:
-                print(f"Forward error: {e}")
+                logging.error(f"[{self.name}] 转发线程异常 {connection_id}: {e}")
 
         finally:
+            logging.debug(f"[{self.name}] 清理连接 {connection_id}")
             try:
                 channel.close()
             except:
@@ -143,6 +371,8 @@ class SSHTunnel:
                 pass
 
     def _keep_tunnel_alive(self):
+        """保持SSH隧道连接活跃"""
+        logging.info(f"[{self.name}] 保活线程开始运行")
         while self.is_running:
             try:
                 if (
@@ -151,13 +381,31 @@ class SSHTunnel:
                     and self.ssh.get_transport().is_active()
                 ):
                     self.ssh.get_transport().send_ignore()
-                time.sleep(30)
+                    logging.debug(f"[{self.name}] 发送保活信号")
+                else:
+                    if self.is_running:  # 只有在应该运行时才报错
+                        logging.warning(f"[{self.name}] SSH连接不活跃，停止隧道")
+                        self.is_running = False
+                        break
+
+                # 分段睡眠，以便快速响应停止信号
+                for _ in range(30):
+                    if not self.is_running:
+                        break
+                    time.sleep(1)
+
             except Exception as e:
-                print(f"Tunnel keep-alive error: {e}")
-                self.is_running = False
+                if self.is_running:
+                    logging.error(f"[{self.name}] 保活线程出错: {e}")
+                    self.is_running = False
                 break
 
+        logging.info(f"[{self.name}] 保活线程结束")
+
     def start(self):
+        logging.info(
+            f"[{self.name}] 开始启动SSH隧道: {self.hostname}:{self.local_port}->{self.remote_port}"
+        )
         try:
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -166,41 +414,45 @@ class SSHTunnel:
             ssh_config = paramiko.SSHConfig()
             config_path = os.path.expanduser("~/.ssh/config")
             if os.path.exists(config_path):
+                logging.info(f"[{self.name}] 读取SSH配置文件: {config_path}")
                 with open(config_path) as f:
                     ssh_config.parse(f)
 
-                # 尝试获取主机配置
                 host_config = ssh_config.lookup(self.hostname)
-                print(host_config)
                 if "user" in host_config:
-                    # 使用配置中的主机名和端口
                     connect_hostname = host_config.get("hostname", self.hostname)
                     connect_port = int(host_config.get("port", 22))
                     username = host_config.get("user")
-                    # 连接参数
+                    logging.info(
+                        f"[{self.name}] 使用SSH配置连接: {username}@{connect_hostname}:{connect_port}"
+                    )
+
                     connect_kwargs = {
                         "hostname": connect_hostname,
                         "port": connect_port,
                     }
 
-                    # 如果配置中有用户名，添加到连接参数
                     if username:
                         connect_kwargs["username"] = username
 
-                    # 如果配置中有密钥文件，添加到连接参数
                     if "identityfile" in host_config:
                         connect_kwargs["key_filename"] = host_config["identityfile"][0]
+                        logging.info(
+                            f"[{self.name}] 使用密钥文件: {host_config['identityfile'][0]}"
+                        )
 
-                    # 使用配置参数连接
                     self.ssh.connect(**connect_kwargs)
                 else:
-                    # 如果在配置中找不到主机，显示凭据对话框
+                    logging.info(f"[{self.name}] SSH配置中未找到主机，显示凭据对话框")
                     dialog = CredentialsDialog(self.root, self.hostname)
                     credentials = dialog.show()
                     if not credentials:
+                        logging.warning(f"[{self.name}] 用户取消连接")
                         raise Exception("Connection cancelled")
 
-                    # 使用对话框提供的凭据连接
+                    logging.info(
+                        f"[{self.name}] 使用用户凭据连接: {credentials['username']}@{self.hostname}:{credentials['port']}"
+                    )
                     self.ssh.connect(
                         hostname=self.hostname,
                         username=credentials["username"],
@@ -208,13 +460,16 @@ class SSHTunnel:
                         port=credentials["port"],
                     )
             else:
-                # 如果没有配置文件，显示凭据对话框
+                logging.info(f"[{self.name}] SSH配置文件不存在，显示凭据对话框")
                 dialog = CredentialsDialog(self.root, self.hostname)
                 credentials = dialog.show()
                 if not credentials:
+                    logging.warning(f"[{self.name}] 用户取消连接")
                     raise Exception("Connection cancelled")
 
-                # 使用对话框提供的凭据连接
+                logging.info(
+                    f"[{self.name}] 使用用户凭据连接: {credentials['username']}@{self.hostname}:{credentials['port']}"
+                )
                 self.ssh.connect(
                     hostname=self.hostname,
                     username=credentials["username"],
@@ -222,191 +477,675 @@ class SSHTunnel:
                     port=credentials["port"],
                 )
 
+            logging.info(f"[{self.name}] SSH连接成功，开始创建本地端口监听")
+
             # 创建本地端口监听
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # self.server_socket.bind(("127.0.0.1", self.local_port))
             self.server_socket.bind(("0.0.0.0", self.local_port))
             self.server_socket.listen(100)
-            self.server_socket.settimeout(1.0)  # 设置超时
+            self.server_socket.settimeout(1.0)
 
-            # 启动连接接受线程
+            logging.info(f"[{self.name}] 本地端口监听成功: 0.0.0.0:{self.local_port}")
+
+            # 启动线程
             self.is_running = True
-            self.forward_threads = []  # 重置转发线程列表
-            self.accept_thread = threading.Thread(target=self._accept_connections)
+            self.start_time = datetime.now()
+            self.forward_threads = []
+
+            logging.info(f"[{self.name}] 启动连接接受线程")
+            self.accept_thread = threading.Thread(
+                target=self._accept_connections, name=f"Accept-{self.name}"
+            )
             self.accept_thread.daemon = True
             self.accept_thread.start()
 
-            # 启动保活线程
-            self.thread = threading.Thread(target=self._keep_tunnel_alive)
+            logging.info(f"[{self.name}] 启动保活线程")
+            self.thread = threading.Thread(
+                target=self._keep_tunnel_alive, name=f"KeepAlive-{self.name}"
+            )
             self.thread.daemon = True
             self.thread.start()
 
+            logging.info(f"[{self.name}] SSH隧道启动完成")
             return True
         except Exception as e:
-            print(f"Error starting tunnel: {e}")
+            logging.error(f"[{self.name}] 启动隧道失败: {e}")
             self.stop()
             return False
 
     def stop(self):
-        # 先设置标志位确保所有线程知道需要退出
+        if not self.is_running:
+            logging.info(f"[{self.name}] 隧道已经停止，无需操作")
+            return
+
+        logging.info(f"[{self.name}] 开始停止SSH隧道")
+
+        # 1. 立即设置停止标志
         self.is_running = False
+        logging.info(f"[{self.name}] 设置停止标志")
 
-        # 1. 关闭SSH连接 - 这会自动关闭所有相关通道
-        if self.ssh:
-            try:
-                self.ssh.close()
-            except:
-                pass
-            self.ssh = None
-
-        # 2. 关闭服务器socket触发accept线程退出
+        # 2. 强制关闭服务器socket - 这会导致accept线程立即退出
         if self.server_socket:
             try:
+                logging.info(f"[{self.name}] 强制关闭服务器Socket")
+                self.server_socket.shutdown(socket.SHUT_RDWR)
                 self.server_socket.close()
-            except:
-                pass
+            except Exception as e:
+                logging.debug(f"[{self.name}] 关闭服务器Socket时出错: {e}")
             self.server_socket = None
 
-        # 3. 等待线程终止
-        threads_to_join = []
-        if self.accept_thread and self.accept_thread.is_alive():
-            threads_to_join.append(self.accept_thread)
-        if self.thread and self.thread.is_alive():
-            threads_to_join.append(self.thread)
-
-        # 加入所有活跃的转发线程
-        for t in self.forward_threads:
-            if t.is_alive():
-                threads_to_join.append(t)
-
-        # 等待所有线程安全退出
-        for t in threads_to_join:
+        # 3. 强制关闭SSH连接 - 这会关闭所有SSH通道
+        if self.ssh:
             try:
+                logging.info(f"[{self.name}] 强制关闭SSH连接")
+                transport = self.ssh.get_transport()
+                if transport:
+                    transport.close()
+                self.ssh.close()
+            except Exception as e:
+                logging.debug(f"[{self.name}] 关闭SSH连接时出错: {e}")
+            self.ssh = None
+
+        # 4. 等待主线程结束
+        threads_to_wait = []
+
+        if self.accept_thread and self.accept_thread.is_alive():
+            threads_to_wait.append(("Accept", self.accept_thread))
+
+        if self.thread and self.thread.is_alive():
+            threads_to_wait.append(("KeepAlive", self.thread))
+
+        # 等待主要线程结束
+        for thread_name, t in threads_to_wait:
+            try:
+                logging.debug(f"[{self.name}] 等待线程 {thread_name} 结束")
                 t.join(timeout=1.0)
                 if t.is_alive():
-                    print(f"Warning: Thread {t.name} did not terminate in time")
-            except:
-                pass
+                    logging.warning(
+                        f"[{self.name}] 线程 {thread_name} 未在规定时间内结束"
+                    )
+                else:
+                    logging.debug(f"[{self.name}] 线程 {thread_name} 已结束")
+            except Exception as e:
+                logging.debug(f"[{self.name}] 等待线程 {thread_name} 时出错: {e}")
 
-        # 4. 清空引用
+        # 5. 清理转发线程（它们应该会自动退出）
+        active_forward_threads = [t for t in self.forward_threads if t.is_alive()]
+        if active_forward_threads:
+            logging.info(
+                f"[{self.name}] 等待 {len(active_forward_threads)} 个转发线程结束"
+            )
+            # 不需要等待转发线程，它们会因为socket关闭而自动退出
+            # 给它们一点时间自然结束
+            import time
+
+            time.sleep(0.5)
+
+            # 检查还有多少线程存活
+            still_alive = [t for t in active_forward_threads if t.is_alive()]
+            if still_alive:
+                logging.warning(
+                    f"[{self.name}] 还有 {len(still_alive)} 个转发线程未结束（这是正常的）"
+                )
+
+        # 6. 清空所有引用
         self.thread = None
         self.accept_thread = None
         self.forward_threads = []
+        self.start_time = None
+
+        logging.info(f"[{self.name}] SSH隧道停止完成")
+
+        # 验证端口是否真的被释放
+        self._verify_port_released()
+
+    def _verify_port_released(self):
+        """验证端口是否已经被释放"""
+        try:
+            # 尝试绑定端口来检查是否已释放
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            test_socket.bind(("0.0.0.0", self.local_port))
+            test_socket.close()
+            logging.info(f"[{self.name}] 端口 {self.local_port} 已成功释放")
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                logging.warning(
+                    f"[{self.name}] 端口 {self.local_port} 仍在使用中，可能需要等待系统释放"
+                )
+            else:
+                logging.debug(f"[{self.name}] 端口验证时出错: {e}")
+        except Exception as e:
+            logging.debug(f"[{self.name}] 端口验证异常: {e}")
+
+    def to_dict(self):
+        return {
+            "tunnel_id": self.tunnel_id,
+            "hostname": self.hostname,
+            "local_port": self.local_port,
+            "remote_port": self.remote_port,
+            "name": self.name,
+        }
+
+    def get_status(self):
+        if not self.is_running:
+            return "已停止"
+
+        # 检查SSH连接状态
+        if not self.ssh or not self.ssh.get_transport():
+            return "连接丢失"
+
+        if not self.ssh.get_transport().is_active():
+            return "连接断开"
+
+        # 连接正常，显示运行时间
+        if self.start_time:
+            elapsed = datetime.now() - self.start_time
+            hours, remainder = divmod(elapsed.total_seconds(), 3600)
+            minutes, _ = divmod(remainder, 60)
+            return f"运行中 ({int(hours)}h{int(minutes)}m)"
+
+        return "运行中"
 
 
 class MainWindow:
     def __init__(self, root):
         self.root = root
-        self.root.title("SSH Tunnel Manager")
-        self.root.geometry("800x800")  # 增加窗口高度以容纳历史记录
-        self.tunnels = []
-        self.history = []  # 添加历史记录列表
+        self.root.title("SSH Tunnel Manager - Enhanced")
+        self.root.geometry("1000x700")
+        self.root.minsize(800, 600)
 
+        self.tunnels = []
+        self.config_manager = ConfigManager()
+        self.saved_configs = []
+        self.tags = {}
+
+        # 加载保存的配置
+        self.load_saved_configs()
+
+        self.create_ui()
+        self.update_table()
+        self.update_saved_configs_tree()
+
+        # 启动定时刷新
+        self.start_auto_refresh()
+
+    def create_ui(self):
         # 创建主框架
-        main_frame = ttk.Frame(root, padding="10")
+        main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # 创建输入框架
-        input_frame = ttk.LabelFrame(main_frame, text="添加新隧道", padding="5")
+        # 菜单栏
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="文件", menu=file_menu)
+        file_menu.add_command(label="选择配置文件路径", command=self.select_config_file)
+        file_menu.add_separator()
+        file_menu.add_command(label="导入配置", command=self.import_config)
+        file_menu.add_command(label="导出配置", command=self.export_config)
+
+        # 添加调试菜单
+        debug_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="调试", menu=debug_menu)
+        debug_menu.add_command(label="显示详细日志", command=self.enable_debug_log)
+        debug_menu.add_command(label="隐藏详细日志", command=self.disable_debug_log)
+
+        # 创建notebook用于标签页
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.grid(
+            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S)
+        )
+
+        # 第一个标签页：活动隧道
+        self.active_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.active_frame, text="活动隧道")
+        self.create_active_tunnels_tab()
+
+        # 第二个标签页：保存的配置
+        self.saved_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.saved_frame, text="保存的配置")
+        self.create_saved_configs_tab()
+
+        # 第三个标签页：标签管理
+        self.tags_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.tags_frame, text="标签管理")
+        self.create_tags_management_tab()
+
+        # 状态栏
+        self.status_bar = ttk.Label(
+            main_frame,
+            text=f"配置文件: {self.config_manager.config_file}",
+            relief=tk.SUNKEN,
+            anchor=tk.W,
+        )
+        self.status_bar.grid(
+            row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0)
+        )
+
+        # 在活动隧道页面添加控制按钮
+        control_frame = ttk.Frame(self.active_frame)
+        control_frame.grid(row=2, column=0, columnspan=2, pady=5)
+
+        ttk.Button(control_frame, text="刷新状态", command=self.manual_refresh).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(
+            control_frame, text="检查端口", command=self.check_ports_status
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            control_frame, text="停止选中的隧道", command=self.stop_selected_tunnel
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            control_frame, text="强制停止选中", command=self.force_stop_selected_tunnel
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            control_frame, text="停止所有隧道", command=self.stop_all_tunnels
+        ).pack(side=tk.LEFT, padx=5)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1)
+
+    def force_stop_selected_tunnel(self):
+        """强制停止选中的隧道"""
+        selection = self.tree.selection()
+        if not selection:
+            logging.warning("用户尝试强制停止隧道但未选择任何隧道")
+            messagebox.showwarning("警告", "请先选择要强制停止的隧道")
+            return
+
+        item = self.tree.item(selection[0])
+        tunnel_tag = item["tags"][0]
+        tunnel = next((t for t in self.tunnels if str(t.tunnel_id) == tunnel_tag), None)
+        if tunnel:
+            logging.info(f"用户请求强制停止隧道: '{tunnel.name}'")
+            if messagebox.askyesno(
+                "确认",
+                f"确定要强制停止隧道 '{tunnel.name}' 吗？\n这将立即终止所有相关连接。",
+            ):
+                self.force_stop_tunnel(tunnel)
+        else:
+            logging.error("无法找到选中的隧道对象")
+            messagebox.showerror("错误", "无法找到选中的隧道")
+
+    def force_stop_tunnel(self, tunnel):
+        """强制停止隧道，不等待线程结束"""
+        logging.info(
+            f"强制停止隧道: '{tunnel.name}' ({tunnel.hostname}:{tunnel.local_port}->{tunnel.remote_port})"
+        )
+
+        if tunnel not in self.tunnels:
+            logging.warning(f"隧道 '{tunnel.name}' 不在活动隧道列表中")
+            return
+
+        # 立即设置停止标志
+        tunnel.is_running = False
+
+        try:
+            # 强制关闭socket
+            if tunnel.server_socket:
+                try:
+                    tunnel.server_socket.shutdown(socket.SHUT_RDWR)
+                    tunnel.server_socket.close()
+                except:
+                    pass
+                tunnel.server_socket = None
+
+            # 强制关闭SSH连接
+            if tunnel.ssh:
+                try:
+                    transport = tunnel.ssh.get_transport()
+                    if transport:
+                        transport.close()
+                    tunnel.ssh.close()
+                except:
+                    pass
+                tunnel.ssh = None
+
+            # 立即从列表中移除
+            self.tunnels.remove(tunnel)
+            self.update_table()
+
+            logging.info(f"隧道 '{tunnel.name}' 已被强制停止")
+            messagebox.showinfo("完成", f"隧道 '{tunnel.name}' 已被强制停止")
+
+        except Exception as e:
+            logging.error(f"强制停止隧道 '{tunnel.name}' 时出错: {e}")
+            # 即使出错也从列表中移除
+            if tunnel in self.tunnels:
+                self.tunnels.remove(tunnel)
+                self.update_table()
+
+    def create_active_tunnels_tab(self):
+        # 输入框架
+        input_frame = ttk.LabelFrame(self.active_frame, text="添加新隧道", padding="5")
         input_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
 
-        # 主机名输入
+        # 第一行：基本信息
         ttk.Label(input_frame, text="主机名:").grid(row=0, column=0, padx=5)
-        self.hostname_input = ttk.Entry(input_frame, width=20)
+        self.hostname_input = ttk.Entry(input_frame, width=15)
         self.hostname_input.grid(row=0, column=1, padx=5)
 
-        # 本地端口输入
         ttk.Label(input_frame, text="本地端口:").grid(row=0, column=2, padx=5)
-        self.local_port_input = ttk.Entry(input_frame, width=10)
+        self.local_port_input = ttk.Entry(input_frame, width=8)
         self.local_port_input.grid(row=0, column=3, padx=5)
 
-        # 远程端口输入
         ttk.Label(input_frame, text="远程端口:").grid(row=0, column=4, padx=5)
-        self.remote_port_input = ttk.Entry(input_frame, width=10)
+        self.remote_port_input = ttk.Entry(input_frame, width=8)
         self.remote_port_input.grid(row=0, column=5, padx=5)
 
-        # 添加按钮
-        add_button = ttk.Button(input_frame, text="添加隧道", command=self.add_tunnel)
-        add_button.grid(row=0, column=6, padx=5)
+        # 第二行：名称
+        ttk.Label(input_frame, text="名称:").grid(row=1, column=0, padx=5, pady=5)
+        self.name_input = ttk.Entry(input_frame, width=30)
+        self.name_input.grid(
+            row=1, column=1, columnspan=3, padx=5, pady=5, sticky=(tk.W, tk.E)
+        )
 
-        # 创建当前隧道表格
-        current_frame = ttk.LabelFrame(main_frame, text="当前隧道", padding="5")
-        current_frame.grid(
+        # 按钮
+        button_frame = ttk.Frame(input_frame)
+        button_frame.grid(row=1, column=4, columnspan=2, padx=5, pady=5)
+
+        ttk.Button(button_frame, text="添加隧道", command=self.add_tunnel).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(
+            button_frame, text="保存配置", command=self.save_current_config
+        ).pack(side=tk.LEFT, padx=2)
+
+        # 活动隧道表格
+        active_frame = ttk.LabelFrame(
+            self.active_frame, text="当前活动隧道", padding="5"
+        )
+        active_frame.grid(
             row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5
         )
 
-        self.tree = ttk.Treeview(
-            current_frame,
-            columns=("hostname", "local_port", "remote_port", "status", "action"),
-            show="headings",
-        )
+        # 创建Treeview
+        columns = ("name", "hostname", "local_port", "remote_port", "status")
+        self.tree = ttk.Treeview(active_frame, columns=columns, show="headings")
         self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # 设置列标题
-        self.tree.heading("hostname", text="主机名")
-        self.tree.heading("local_port", text="本地端口")
-        self.tree.heading("remote_port", text="远程端口")
-        self.tree.heading("status", text="状态")
-        self.tree.heading("action", text="操作")
+        # 设置列标题和宽度
+        headers = {
+            "name": ("名称", 200),
+            "hostname": ("主机名", 150),
+            "local_port": ("本地端口", 100),
+            "remote_port": ("远程端口", 100),
+            "status": ("状态", 150),
+        }
 
-        # 设置列宽
-        self.tree.column("hostname", width=200)
-        self.tree.column("local_port", width=100)
-        self.tree.column("remote_port", width=100)
-        self.tree.column("status", width=100)
-        self.tree.column("action", width=100)
+        for col, (header, width) in headers.items():
+            self.tree.heading(col, text=header)
+            self.tree.column(col, width=width)
 
         # 添加滚动条
-        scrollbar = ttk.Scrollbar(
-            current_frame, orient=tk.VERTICAL, command=self.tree.yview
+        scrollbar1 = ttk.Scrollbar(
+            active_frame, orient=tk.VERTICAL, command=self.tree.yview
         )
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar1.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.tree.configure(yscrollcommand=scrollbar1.set)
 
-        # 创建历史记录表格
-        history_frame = ttk.LabelFrame(main_frame, text="历史记录", padding="5")
-        history_frame.grid(
-            row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5
-        )
+        # 绑定双击事件
+        self.tree.bind("<Double-1>", self.on_tunnel_double_click)
 
-        self.history_tree = ttk.Treeview(
-            history_frame,
-            columns=("hostname", "local_port", "remote_port", "action"),
-            show="headings",
-        )
-        self.history_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # 设置历史记录列标题
-        self.history_tree.heading("hostname", text="主机名")
-        self.history_tree.heading("local_port", text="本地端口")
-        self.history_tree.heading("remote_port", text="远程端口")
-        self.history_tree.heading("action", text="操作")
-
-        # 设置历史记录列宽
-        self.history_tree.column("hostname", width=200)
-        self.history_tree.column("local_port", width=100)
-        self.history_tree.column("remote_port", width=100)
-        self.history_tree.column("action", width=100)
-
-        # 添加历史记录滚动条
-        history_scrollbar = ttk.Scrollbar(
-            history_frame, orient=tk.VERTICAL, command=self.history_tree.yview
-        )
-        history_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.history_tree.configure(yscrollcommand=history_scrollbar.set)
+        # 添加右键菜单
+        self.tree_menu = tk.Menu(self.tree, tearoff=0)
+        self.tree_menu.add_command(label="停止隧道", command=self.stop_selected_tunnel)
+        self.tree.bind("<Button-3>", self.show_tree_menu)
 
         # 配置网格权重
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(1, weight=1)
-        main_frame.rowconfigure(2, weight=1)
-        current_frame.columnconfigure(0, weight=1)
-        current_frame.rowconfigure(0, weight=1)
-        history_frame.columnconfigure(0, weight=1)
-        history_frame.rowconfigure(0, weight=1)
+        input_frame.columnconfigure(1, weight=1)
+        self.active_frame.columnconfigure(0, weight=1)
+        self.active_frame.rowconfigure(1, weight=1)
+        active_frame.columnconfigure(0, weight=1)
+        active_frame.rowconfigure(0, weight=1)
+
+    def create_saved_configs_tab(self):
+        # 工具栏
+        toolbar_frame = ttk.Frame(self.saved_frame)
+        toolbar_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        ttk.Button(
+            toolbar_frame, text="刷新", command=self.update_saved_configs_tree
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            toolbar_frame, text="删除选中", command=self.delete_selected_config
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar_frame, text="编辑", command=self.edit_selected_config).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        # 过滤框架
+        filter_frame = ttk.LabelFrame(toolbar_frame, text="过滤", padding="3")
+        filter_frame.pack(side=tk.LEFT, padx=(20, 5))
+
+        # 标签过滤
+        ttk.Label(filter_frame, text="标签:").grid(row=0, column=0, padx=2)
+        self.tag_filter = ttk.Combobox(filter_frame, width=12, state="readonly")
+        self.tag_filter.grid(row=0, column=1, padx=2)
+        self.tag_filter.bind("<<ComboboxSelected>>", self.on_filter_changed)
+
+        # 名称过滤
+        ttk.Label(filter_frame, text="名称:").grid(row=0, column=2, padx=(10, 2))
+        self.name_filter = ttk.Entry(filter_frame, width=15)
+        self.name_filter.grid(row=0, column=3, padx=2)
+        self.name_filter.bind("<KeyRelease>", self.on_filter_changed)
+
+        # 清空过滤按钮
+        ttk.Button(filter_frame, text="清空", command=self.clear_filters).grid(
+            row=0, column=4, padx=5
+        )
+
+        self.update_tag_filter()
+
+        # 保存的配置表格
+        saved_frame = ttk.LabelFrame(self.saved_frame, text="保存的配置", padding="5")
+        saved_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+
+        columns = ("name", "hostname", "local_port", "remote_port", "tags")
+        self.saved_tree = ttk.Treeview(saved_frame, columns=columns, show="headings")
+        self.saved_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        headers = {
+            "name": ("名称", 200),
+            "hostname": ("主机名", 150),
+            "local_port": ("本地端口", 100),
+            "remote_port": ("远程端口", 100),
+            "tags": ("标签", 200),
+        }
+
+        for col, (header, width) in headers.items():
+            self.saved_tree.heading(col, text=header)
+            self.saved_tree.column(col, width=width)
+
+        scrollbar2 = ttk.Scrollbar(
+            saved_frame, orient=tk.VERTICAL, command=self.saved_tree.yview
+        )
+        scrollbar2.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.saved_tree.configure(yscrollcommand=scrollbar2.set)
+
+        # 绑定双击事件
+        self.saved_tree.bind("<Double-1>", self.on_saved_config_double_click)
+
+        # 配置网格权重
+        self.saved_frame.columnconfigure(0, weight=1)
+        self.saved_frame.rowconfigure(1, weight=1)
+        saved_frame.columnconfigure(0, weight=1)
+        saved_frame.rowconfigure(0, weight=1)
+
+    def create_tags_management_tab(self):
+        # 标签输入框架
+        input_frame = ttk.LabelFrame(self.tags_frame, text="标签管理", padding="5")
+        input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        ttk.Label(input_frame, text="标签名:").grid(row=0, column=0, padx=5, pady=5)
+        self.tag_name_input = ttk.Entry(input_frame, width=20)
+        self.tag_name_input.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Button(input_frame, text="添加标签", command=self.add_tag).grid(
+            row=0, column=2, padx=5, pady=5
+        )
+        ttk.Button(input_frame, text="删除标签", command=self.delete_tag).grid(
+            row=0, column=3, padx=5, pady=5
+        )
+
+        # 标签列表
+        tags_list_frame = ttk.LabelFrame(self.tags_frame, text="现有标签", padding="5")
+        tags_list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+
+        self.tags_listbox = tk.Listbox(tags_list_frame)
+        self.tags_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        tags_scrollbar = ttk.Scrollbar(
+            tags_list_frame, orient=tk.VERTICAL, command=self.tags_listbox.yview
+        )
+        tags_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.tags_listbox.configure(yscrollcommand=tags_scrollbar.set)
+
+        self.update_tags_list()
+
+        # 配置网格权重
+        self.tags_frame.columnconfigure(0, weight=1)
+        self.tags_frame.rowconfigure(1, weight=1)
+        tags_list_frame.columnconfigure(0, weight=1)
+        tags_list_frame.rowconfigure(0, weight=1)
+
+    def select_config_file(self):
+        file_path = filedialog.asksaveasfilename(
+            title="选择配置文件保存位置",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="tunnels.json",
+        )
+
+        if file_path:
+            # 先保存当前配置到新位置
+            old_config_file = self.config_manager.config_file
+            self.config_manager.set_config_path(file_path)
+
+            if self.config_manager.save_config(self.saved_configs, self.tags):
+                self.status_bar.config(text=f"配置文件: {file_path}")
+                messagebox.showinfo("成功", f"配置文件路径已更改为: {file_path}")
+            else:
+                # 如果保存失败，恢复原路径
+                self.config_manager.set_config_path(old_config_file)
+                messagebox.showerror("错误", "无法保存到新的配置文件路径")
+
+    def import_config(self):
+        file_path = filedialog.askopenfilename(
+            title="选择要导入的配置文件",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+
+        if file_path:
+            try:
+                temp_manager = ConfigManager(file_path)
+                imported_configs, imported_tags = temp_manager.load_config()
+
+                if imported_configs or imported_tags:
+                    # 合并配置
+                    for config in imported_configs:
+                        existing = next(
+                            (
+                                c
+                                for c in self.saved_configs
+                                if c["tunnel_id"] == config["tunnel_id"]
+                            ),
+                            None,
+                        )
+                        if not existing:
+                            self.saved_configs.append(config)
+
+                    self.tags.update(imported_tags)
+
+                    self.save_configs()
+                    self.update_saved_configs_tree()
+                    self.update_tag_filter()
+                    self.update_tags_list()
+
+                    messagebox.showinfo(
+                        "成功",
+                        f"已导入 {len(imported_configs)} 个配置和 {len(imported_tags)} 个标签",
+                    )
+                else:
+                    messagebox.showwarning("警告", "配置文件为空或格式不正确")
+            except Exception as e:
+                messagebox.showerror("错误", f"导入失败: {str(e)}")
+
+    def export_config(self):
+        file_path = filedialog.asksaveasfilename(
+            title="导出配置文件",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile=f"tunnels_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        )
+
+        if file_path:
+            try:
+                temp_manager = ConfigManager(file_path)
+                if temp_manager.save_config(self.saved_configs, self.tags):
+                    messagebox.showinfo("成功", f"配置已导出到: {file_path}")
+                else:
+                    messagebox.showerror("错误", "导出失败")
+            except Exception as e:
+                messagebox.showerror("错误", f"导出失败: {str(e)}")
+
+    def load_saved_configs(self):
+        self.saved_configs, self.tags = self.config_manager.load_config()
+
+    def save_configs(self):
+        return self.config_manager.save_config(self.saved_configs, self.tags)
 
     def add_tunnel(self):
-        hostname = self.hostname_input.get()
+        hostname = self.hostname_input.get().strip()
+        name = self.name_input.get().strip()
+
+        logging.info(f"用户尝试添加隧道: 主机={hostname}, 名称={name}")
+
+        try:
+            local_port = int(self.local_port_input.get())
+            remote_port = int(self.remote_port_input.get())
+        except ValueError:
+            logging.error("添加隧道失败: 端口格式错误")
+            messagebox.showerror("错误", "端口必须是数字")
+            return
+
+        if not hostname or not local_port or not remote_port:
+            logging.error("添加隧道失败: 必填字段为空")
+            messagebox.showerror("错误", "请至少填写主机名和端口")
+            return
+
+        # 检查端口是否已被使用
+        for tunnel in self.tunnels:
+            if tunnel.local_port == local_port:
+                logging.warning(
+                    f"添加隧道失败: 本地端口 {local_port} 已被隧道 '{tunnel.name}' 使用"
+                )
+                messagebox.showerror("错误", f"本地端口 {local_port} 已被使用")
+                return
+
+        tunnel_name = name or f"{hostname}:{local_port}->{remote_port}"
+        logging.info(f"开始创建隧道: {tunnel_name}")
+
+        tunnel = SSHTunnel(
+            hostname, local_port, remote_port, self.root, name=tunnel_name
+        )
+        if tunnel.start():
+            self.tunnels.append(tunnel)
+            self.update_table()
+            self.clear_inputs()
+            logging.info(f"隧道 '{tunnel_name}' 添加成功")
+        else:
+            logging.error(f"隧道 '{tunnel_name}' 启动失败")
+            messagebox.showerror("错误", "无法启动隧道")
+
+    def save_current_config(self):
+        hostname = self.hostname_input.get().strip()
+        name = self.name_input.get().strip()
+
         try:
             local_port = int(self.local_port_input.get())
             remote_port = int(self.remote_port_input.get())
@@ -415,105 +1154,707 @@ class MainWindow:
             return
 
         if not hostname or not local_port or not remote_port:
-            messagebox.showerror("错误", "请填写所有字段")
+            messagebox.showerror("错误", "请至少填写主机名和端口")
             return
 
-        tunnel = SSHTunnel(hostname, local_port, remote_port, self.root)
-        if tunnel.start():
-            self.tunnels.append(tunnel)
-            # 添加到历史记录
-            self.history.append(
-                {
-                    "hostname": hostname,
-                    "local_port": local_port,
-                    "remote_port": remote_port,
-                }
-            )
-            self.update_table()
-            self.update_history()
-            self.clear_inputs()
+        # 选择标签
+        tag_dialog = TagSelectionDialog(self.root, list(self.tags.keys()))
+        selected_tags = tag_dialog.show()
+
+        config = {
+            "tunnel_id": f"{hostname}:{local_port}->{remote_port}",
+            "hostname": hostname,
+            "local_port": local_port,
+            "remote_port": remote_port,
+            "name": name or f"{hostname}:{local_port}->{remote_port}",
+            "tags": selected_tags or [],
+            "created": datetime.now().isoformat(),
+        }
+
+        # 检查是否已存在相同配置
+        existing = next(
+            (c for c in self.saved_configs if c["tunnel_id"] == config["tunnel_id"]),
+            None,
+        )
+        if existing:
+            if messagebox.askyesno("确认", "配置已存在，是否覆盖？"):
+                idx = self.saved_configs.index(existing)
+                self.saved_configs[idx] = config
         else:
-            messagebox.showerror("错误", "无法启动隧道")
+            self.saved_configs.append(config)
+
+        if self.save_configs():
+            self.update_saved_configs_tree()
+            self.clear_inputs()
+            messagebox.showinfo("成功", "配置已保存")
+        else:
+            messagebox.showerror("错误", "保存配置失败")
 
     def clear_inputs(self):
         self.hostname_input.delete(0, tk.END)
         self.local_port_input.delete(0, tk.END)
         self.remote_port_input.delete(0, tk.END)
+        self.name_input.delete(0, tk.END)
+
+    def clear_filters(self):
+        self.tag_filter.set("全部")
+        self.name_filter.delete(0, tk.END)
+        self.update_saved_configs_tree()
 
     def update_table(self):
-        # 清除现有项目
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # 添加新项目
         for tunnel in self.tunnels:
-            item = self.tree.insert(
+            # 使用隧道的tunnel_id作为唯一标识，而不是Python的id()
+            self.tree.insert(
                 "",
                 tk.END,
                 values=(
+                    tunnel.name,
                     tunnel.hostname,
                     str(tunnel.local_port),
                     str(tunnel.remote_port),
-                    "运行中" if tunnel.is_running else "已停止",
-                    "停止",  # 为操作列添加默认文本
+                    tunnel.get_status(),
                 ),
-                tags=(str(id(tunnel)),),
+                tags=(tunnel.tunnel_id,),  # 使用tunnel_id而不是id(tunnel)
             )
 
-            # 绑定点击事件到整行
-            self.tree.tag_bind(
-                str(id(tunnel)), "<Button-1>", lambda e, t=tunnel: self.stop_tunnel(t)
-            )
+    def update_saved_configs_tree(self):
+        for item in self.saved_tree.get_children():
+            self.saved_tree.delete(item)
 
-    def update_history(self):
-        # 清除现有历史记录
-        for item in self.history_tree.get_children():
-            self.history_tree.delete(item)
+        # 获取过滤条件
+        filter_tag = self.tag_filter.get()
+        filter_name = self.name_filter.get().strip().lower()
 
-        # 添加历史记录
-        for record in self.history:
-            item = self.history_tree.insert(
+        for config in self.saved_configs:
+            # 标签过滤
+            if (
+                filter_tag
+                and filter_tag != "全部"
+                and filter_tag not in config.get("tags", [])
+            ):
+                continue
+
+            # 名称过滤
+            if filter_name and filter_name not in config["name"].lower():
+                continue
+
+            tags_str = ", ".join(config.get("tags", []))
+            self.saved_tree.insert(
                 "",
                 tk.END,
                 values=(
-                    record["hostname"],
-                    str(record["local_port"]),
-                    str(record["remote_port"]),
-                    "重新连接",  # 为操作列添加默认文本
+                    config["name"],
+                    config["hostname"],
+                    str(config["local_port"]),
+                    str(config["remote_port"]),
+                    tags_str,
                 ),
-                tags=(str(id(record)),),
+                tags=(config["tunnel_id"],),
             )
 
-            # 绑定点击事件到整行
-            self.history_tree.tag_bind(
-                str(id(record)),
-                "<Button-1>",
-                lambda e, r=record: self.reconnect_from_history(r),
-            )
+    def update_tag_filter(self):
+        tags = ["全部"] + list(self.tags.keys())
+        self.tag_filter["values"] = tags
+        if not self.tag_filter.get():
+            self.tag_filter.set("全部")
 
-    def reconnect_from_history(self, record):
-        tunnel = SSHTunnel(
-            record["hostname"], record["local_port"], record["remote_port"], self.root
+    def update_tags_list(self):
+        self.tags_listbox.delete(0, tk.END)
+        for tag_name in self.tags.keys():
+            self.tags_listbox.insert(tk.END, tag_name)
+
+    def add_tag(self):
+        tag_name = self.tag_name_input.get().strip()
+
+        if not tag_name:
+            messagebox.showerror("错误", "请输入标签名称")
+            return
+
+        if tag_name in self.tags:
+            messagebox.showerror("错误", "标签已存在")
+            return
+
+        self.tags[tag_name] = {"created": datetime.now().isoformat()}
+        if self.save_configs():
+            self.update_tags_list()
+            self.update_tag_filter()
+            self.tag_name_input.delete(0, tk.END)
+            messagebox.showinfo("成功", f"标签 '{tag_name}' 已添加")
+        else:
+            messagebox.showerror("错误", "保存标签失败")
+
+    def delete_tag(self):
+        selection = self.tags_listbox.curselection()
+        if not selection:
+            messagebox.showerror("错误", "请选择要删除的标签")
+            return
+
+        tag_name = self.tags_listbox.get(selection[0])
+
+        if messagebox.askyesno(
+            "确认", f"确定要删除标签 '{tag_name}' 吗？\n这将从所有配置中移除该标签。"
+        ):
+            del self.tags[tag_name]
+
+            # 从所有配置中移除该标签
+            for config in self.saved_configs:
+                if tag_name in config.get("tags", []):
+                    config["tags"].remove(tag_name)
+
+            if self.save_configs():
+                self.update_tags_list()
+                self.update_tag_filter()
+                self.update_saved_configs_tree()
+                messagebox.showinfo("成功", f"标签 '{tag_name}' 已删除")
+            else:
+                messagebox.showerror("错误", "删除标签失败")
+
+    def on_filter_changed(self, event=None):
+        self.update_saved_configs_tree()
+
+    def on_tunnel_double_click(self, event):
+        # 双击切换隧道状态：运行中则停止，已停止则无操作
+        selection = self.tree.selection()
+        if selection:
+            item = self.tree.item(selection[0])
+            tunnel_tag = item["tags"][0]
+            tunnel = next(
+                (t for t in self.tunnels if str(t.tunnel_id) == tunnel_tag), None
+            )
+            if tunnel and tunnel.is_running:
+                if messagebox.askyesno("确认", f"确定要停止隧道 '{tunnel.name}' 吗？"):
+                    self.stop_tunnel(tunnel)
+
+    def show_tree_menu(self, event):
+        """显示右键菜单"""
+        try:
+            item = self.tree.selection()[0]
+            self.tree_menu.post(event.x_root, event.y_root)
+        except IndexError:
+            pass
+
+    def stop_selected_tunnel(self):
+        """停止选中的隧道"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("警告", "请先选择要停止的隧道")
+            return
+
+        item = self.tree.item(selection[0])
+        tunnel_tag = item["tags"][0]
+        tunnel = next((t for t in self.tunnels if str(t.tunnel_id) == tunnel_tag), None)
+        if tunnel:
+            if messagebox.askyesno("确认", f"确定要停止隧道 '{tunnel.name}' 吗？"):
+                self.stop_tunnel(tunnel)
+
+    def stop_tunnel(self, tunnel):
+        logging.info(
+            f"用户请求停止隧道: '{tunnel.name}' ({tunnel.hostname}:{tunnel.local_port}->{tunnel.remote_port})"
         )
+
+        if tunnel not in self.tunnels:
+            logging.warning(f"隧道 '{tunnel.name}' 不在活动隧道列表中")
+            return
+
+        logging.info(f"开始停止隧道: '{tunnel.name}'")
+        try:
+            tunnel.stop()
+            if tunnel in self.tunnels:  # 确保隧道还在列表中再移除
+                self.tunnels.remove(tunnel)
+            self.update_table()
+            logging.info(f"隧道 '{tunnel.name}' 已成功停止并从列表中移除")
+        except Exception as e:
+            logging.error(f"停止隧道 '{tunnel.name}' 时出错: {e}")
+            # 即使出错也尝试从列表中移除
+            if tunnel in self.tunnels:
+                self.tunnels.remove(tunnel)
+                self.update_table()
+
+    def stop_all_tunnels(self):
+        """停止所有隧道"""
+        if not self.tunnels:
+            logging.info("用户尝试停止所有隧道，但当前没有运行的隧道")
+            messagebox.showinfo("信息", "当前没有运行的隧道")
+            return
+
+        tunnel_count = len(self.tunnels)
+        logging.info(f"用户请求停止所有隧道，共 {tunnel_count} 个")
+
+        if messagebox.askyesno("确认", f"确定要停止所有 {tunnel_count} 个隧道吗？"):
+            tunnels_to_stop = self.tunnels.copy()  # 创建副本避免迭代时修改列表
+            failed_count = 0
+
+            for tunnel in tunnels_to_stop:
+                try:
+                    logging.info(f"停止隧道: '{tunnel.name}'")
+                    tunnel.stop()
+                except Exception as e:
+                    logging.error(f"停止隧道 '{tunnel.name}' 失败: {e}")
+                    failed_count += 1
+
+            self.tunnels.clear()
+            self.update_table()
+
+            if failed_count > 0:
+                logging.warning(f"停止所有隧道完成，有 {failed_count} 个隧道停止时出错")
+                messagebox.showwarning(
+                    "警告", f"所有隧道已停止，但有 {failed_count} 个隧道停止时出错"
+                )
+            else:
+                logging.info("所有隧道已成功停止")
+                messagebox.showinfo("完成", "所有隧道已停止")
+
+    def on_saved_config_double_click(self, event):
+        selection = self.saved_tree.selection()
+        if selection:
+            item = self.saved_tree.item(selection[0])
+            tunnel_id = item["tags"][0]
+            config = next(
+                (c for c in self.saved_configs if c["tunnel_id"] == tunnel_id), None
+            )
+            if config:
+                logging.info(f"用户双击启动保存的配置: '{config['name']}'")
+                self.start_tunnel_from_config(config)
+            else:
+                logging.error("无法找到双击的配置对象")
+
+    def start_tunnel_from_config(self, config):
+        logging.info(f"用户请求从配置启动隧道: '{config['name']}'")
+
+        # 检查端口是否已被使用
+        for tunnel in self.tunnels:
+            if tunnel.local_port == config["local_port"]:
+                logging.warning(
+                    f"启动隧道失败: 本地端口 {config['local_port']} 已被隧道 '{tunnel.name}' 使用"
+                )
+                messagebox.showerror(
+                    "错误", f"本地端口 {config['local_port']} 已被使用"
+                )
+                return
+
+        logging.info(
+            f"开始创建隧道: {config['name']} ({config['hostname']}:{config['local_port']}->{config['remote_port']})"
+        )
+
+        tunnel = SSHTunnel(
+            config["hostname"],
+            config["local_port"],
+            config["remote_port"],
+            self.root,
+            tunnel_id=config["tunnel_id"],
+            name=config["name"],
+        )
+
         if tunnel.start():
             self.tunnels.append(tunnel)
             self.update_table()
+            logging.info(f"隧道 '{config['name']}' 启动成功")
         else:
-            messagebox.showerror("错误", "无法重新连接隧道")
+            logging.error(f"隧道 '{config['name']}' 启动失败")
+            messagebox.showerror("错误", "无法启动隧道")
 
-    def stop_tunnel(self, tunnel):
-        tunnel.stop()
-        self.tunnels = [t for t in self.tunnels if t != tunnel]  # 安全移除
-        self.update_table()
+    def delete_selected_config(self):
+        selection = self.saved_tree.selection()
+        if not selection:
+            messagebox.showerror("错误", "请选择要删除的配置")
+            return
+
+        item = self.saved_tree.item(selection[0])
+        tunnel_id = item["tags"][0]
+        config = next(
+            (c for c in self.saved_configs if c["tunnel_id"] == tunnel_id), None
+        )
+
+        if config:
+            if messagebox.askyesno("确认", f"确定要删除配置 '{config['name']}' 吗？"):
+                self.saved_configs.remove(config)
+                if self.save_configs():
+                    self.update_saved_configs_tree()
+                    messagebox.showinfo("成功", "配置已删除")
+                else:
+                    messagebox.showerror("错误", "删除配置失败")
+
+    def edit_selected_config(self):
+        selection = self.saved_tree.selection()
+        if not selection:
+            messagebox.showerror("错误", "请选择要编辑的配置")
+            return
+
+        item = self.saved_tree.item(selection[0])
+        tunnel_id = item["tags"][0]
+        config = next(
+            (c for c in self.saved_configs if c["tunnel_id"] == tunnel_id), None
+        )
+
+        if config:
+            dialog = ConfigEditDialog(self.root, config, list(self.tags.keys()))
+            result = dialog.show()
+            if result:
+                # 更新配置
+                idx = self.saved_configs.index(config)
+                self.saved_configs[idx] = result
+                if self.save_configs():
+                    self.update_saved_configs_tree()
+                    messagebox.showinfo("成功", "配置已更新")
+                else:
+                    messagebox.showerror("错误", "更新配置失败")
+
+    def start_auto_refresh(self):
+        """启动自动刷新状态"""
+        self.auto_refresh_active = True
+        self.schedule_refresh()
+
+    def schedule_refresh(self):
+        """调度下次刷新"""
+        if hasattr(self, "auto_refresh_active") and self.auto_refresh_active:
+            # 检查是否有不活跃的隧道需要清理
+            self.check_tunnel_status()
+            # 更新界面
+            self.update_table()
+            # 每5秒刷新一次
+            self.root.after(5000, self.schedule_refresh)
+
+    def check_tunnel_status(self):
+        """检查隧道状态，清理无效的隧道"""
+        if not hasattr(self, "auto_refresh_active") or not self.auto_refresh_active:
+            return
+
+        tunnels_to_remove = []
+
+        for tunnel in self.tunnels:
+            if tunnel.is_running:
+                # 检查SSH连接是否还活跃
+                if (
+                    not tunnel.ssh
+                    or not tunnel.ssh.get_transport()
+                    or not tunnel.ssh.get_transport().is_active()
+                ):
+                    logging.warning(
+                        f"检测到隧道 '{tunnel.name}' 连接已断开，将其标记为停止"
+                    )
+                    tunnel.is_running = False
+                    tunnels_to_remove.append(tunnel)
+            else:
+                # 如果隧道标记为不运行，但还在列表中，移除它
+                if tunnel in self.tunnels:
+                    tunnels_to_remove.append(tunnel)
+
+        # 清理无效隧道
+        for tunnel in tunnels_to_remove:
+            try:
+                if tunnel in self.tunnels:
+                    self.tunnels.remove(tunnel)
+                    logging.info(f"自动清理失效隧道: '{tunnel.name}'")
+            except Exception as e:
+                logging.error(f"清理失效隧道 '{tunnel.name}' 时出错: {e}")
+
+    def manual_refresh(self):
+        """手动刷新状态"""
+        logging.info("用户手动刷新隧道状态")
+        # 暂时停止自动刷新
+        was_active = getattr(self, "auto_refresh_active", True)
+        self.auto_refresh_active = False
+
+        try:
+            self.check_tunnel_status()
+            self.update_table()
+        finally:
+            # 恢复自动刷新状态
+            self.auto_refresh_active = was_active
+
+        messagebox.showinfo("完成", "状态已刷新")
+
+    def check_ports_status(self):
+        """检查所有隧道端口的实际占用状态"""
+        logging.info("用户请求检查端口状态")
+
+        if not self.tunnels:
+            messagebox.showinfo("信息", "当前没有活动隧道")
+            return
+
+        port_status = []
+        for tunnel in self.tunnels:
+            is_listening = self._check_port_listening(tunnel.local_port)
+            port_status.append(
+                f"端口 {tunnel.local_port} ({tunnel.name}): {'监听中' if is_listening else '未监听'}"
+            )
+            logging.info(
+                f"端口状态检查 - {tunnel.local_port}: {'监听中' if is_listening else '未监听'}"
+            )
+
+        status_text = "\n".join(port_status)
+        messagebox.showinfo("端口状态", status_text)
+
+    def _check_port_listening(self, port):
+        """检查端口是否正在监听"""
+        try:
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.settimeout(1)
+            result = test_socket.connect_ex(("127.0.0.1", port))
+            test_socket.close()
+            return result == 0
+        except Exception:
+            return False
+
+    def enable_debug_log(self):
+        """启用详细日志"""
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.info("已启用详细日志模式")
+        messagebox.showinfo("调试", "已启用详细日志模式\n现在会显示所有连接和线程操作")
+
+    def disable_debug_log(self):
+        """禁用详细日志"""
+        logging.getLogger().setLevel(logging.INFO)
+        logging.info("已禁用详细日志模式")
+        messagebox.showinfo("调试", "已禁用详细日志模式\n现在只显示重要操作信息")
 
     def on_closing(self):
-        for tunnel in self.tunnels:
-            tunnel.stop()
+        logging.info("用户关闭应用程序，开始清理资源")
+
+        # 停止自动刷新
+        self.auto_refresh_active = False
+
+        active_tunnels = len(self.tunnels)
+        if active_tunnels > 0:
+            logging.info(f"关闭应用前停止 {active_tunnels} 个活动隧道")
+            for tunnel in self.tunnels:
+                try:
+                    logging.info(f"停止隧道: '{tunnel.name}'")
+                    tunnel.stop()
+                except Exception as e:
+                    logging.error(f"停止隧道 '{tunnel.name}' 时出错: {e}")
+        logging.info("应用程序清理完成，即将退出")
         self.root.destroy()
 
 
+class TagSelectionDialog:
+    def __init__(self, parent, available_tags):
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("选择标签")
+        self.dialog.geometry("300x400")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        self.dialog.resizable(False, False)
+
+        # 居中显示
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (self.dialog.winfo_width() // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (self.dialog.winfo_height() // 2)
+        self.dialog.geometry(f"+{x}+{y}")
+
+        self.available_tags = available_tags
+        self.selected_tags = []
+
+        # 创建UI
+        ttk.Label(self.dialog, text="选择标签 (用于分组):", font=("", 12, "bold")).pack(
+            pady=10
+        )
+
+        # 标签复选框框架
+        if available_tags:
+            checkbox_frame = ttk.Frame(self.dialog)
+            checkbox_frame.pack(expand=True, fill=tk.BOTH, padx=20, pady=10)
+
+            self.tag_vars = {}
+            for tag in available_tags:
+                var = tk.BooleanVar()
+                self.tag_vars[tag] = var
+                ttk.Checkbutton(checkbox_frame, text=tag, variable=var).pack(
+                    anchor=tk.W, pady=2
+                )
+        else:
+            ttk.Label(
+                self.dialog,
+                text="暂无可用标签\n请先在标签管理页面创建标签",
+                foreground="gray",
+            ).pack(pady=50)
+            self.tag_vars = {}
+
+        # 按钮框架
+        button_frame = ttk.Frame(self.dialog)
+        button_frame.pack(pady=20)
+
+        ttk.Button(button_frame, text="确定", command=self.ok_clicked).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(button_frame, text="取消", command=self.cancel_clicked).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        self.result = None
+
+    def ok_clicked(self):
+        self.result = [tag for tag, var in self.tag_vars.items() if var.get()]
+        self.dialog.destroy()
+
+    def cancel_clicked(self):
+        self.result = None
+        self.dialog.destroy()
+
+    def show(self):
+        self.dialog.wait_window()
+        return self.result
+
+
+class ConfigEditDialog:
+    def __init__(self, parent, config, available_tags):
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("编辑配置")
+        self.dialog.geometry("400x500")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        self.dialog.resizable(False, False)
+
+        # 居中显示
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (self.dialog.winfo_width() // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (self.dialog.winfo_height() // 2)
+        self.dialog.geometry(f"+{x}+{y}")
+
+        self.config = config.copy()
+        self.available_tags = available_tags
+
+        # 创建UI
+        main_frame = ttk.Frame(self.dialog, padding="20")
+        main_frame.pack(expand=True, fill=tk.BOTH)
+
+        # 基本信息
+        info_frame = ttk.LabelFrame(main_frame, text="基本信息", padding="10")
+        info_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(info_frame, text="名称:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.name_entry = ttk.Entry(info_frame, width=30)
+        self.name_entry.insert(0, config.get("name", ""))
+        self.name_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2)
+
+        ttk.Label(info_frame, text="主机名:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.hostname_entry = ttk.Entry(info_frame, width=30)
+        self.hostname_entry.insert(0, config.get("hostname", ""))
+        self.hostname_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2)
+
+        ttk.Label(info_frame, text="本地端口:").grid(
+            row=2, column=0, sticky=tk.W, pady=2
+        )
+        self.local_port_entry = ttk.Entry(info_frame, width=30)
+        self.local_port_entry.insert(0, str(config.get("local_port", "")))
+        self.local_port_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=2)
+
+        ttk.Label(info_frame, text="远程端口:").grid(
+            row=3, column=0, sticky=tk.W, pady=2
+        )
+        self.remote_port_entry = ttk.Entry(info_frame, width=30)
+        self.remote_port_entry.insert(0, str(config.get("remote_port", "")))
+        self.remote_port_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=2)
+
+        info_frame.columnconfigure(1, weight=1)
+
+        # 标签选择
+        tags_frame = ttk.LabelFrame(main_frame, text="标签 (用于分组)", padding="10")
+        tags_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        if available_tags:
+            self.tag_vars = {}
+            current_tags = config.get("tags", [])
+
+            for tag in available_tags:
+                var = tk.BooleanVar()
+                if tag in current_tags:
+                    var.set(True)
+                self.tag_vars[tag] = var
+                ttk.Checkbutton(tags_frame, text=tag, variable=var).pack(
+                    anchor=tk.W, pady=1
+                )
+        else:
+            ttk.Label(tags_frame, text="暂无可用标签", foreground="gray").pack(pady=20)
+            self.tag_vars = {}
+
+        # 按钮
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=20)
+
+        ttk.Button(button_frame, text="保存", command=self.save_clicked).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(button_frame, text="取消", command=self.cancel_clicked).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        self.result = None
+
+    def save_clicked(self):
+        try:
+            # 验证输入
+            name = self.name_entry.get().strip()
+            hostname = self.hostname_entry.get().strip()
+            local_port = int(self.local_port_entry.get())
+            remote_port = int(self.remote_port_entry.get())
+
+            if not hostname:
+                messagebox.showerror("错误", "主机名不能为空")
+                return
+
+            selected_tags = [tag for tag, var in self.tag_vars.items() if var.get()]
+
+            # 更新配置
+            self.result = {
+                "tunnel_id": f"{hostname}:{local_port}->{remote_port}",
+                "hostname": hostname,
+                "local_port": local_port,
+                "remote_port": remote_port,
+                "name": name or f"{hostname}:{local_port}->{remote_port}",
+                "tags": selected_tags,
+                "created": self.config.get("created"),
+                "modified": datetime.now().isoformat(),
+            }
+
+            self.dialog.destroy()
+
+        except ValueError:
+            messagebox.showerror("错误", "端口必须是数字")
+
+    def cancel_clicked(self):
+        self.result = None
+        self.dialog.destroy()
+
+    def show(self):
+        self.dialog.wait_window()
+        return self.result
+
+
 if __name__ == "__main__":
+    # 打印启动信息
+    print("=" * 60)
+    print("SSH隧道管理器 - 增强版")
+    print("=" * 60)
+    print("💡 使用提示：")
+    print("   • 浏览器访问一个页面会创建多个连接（正常现象）")
+    print("   • 如果普通停止不生效，请使用'强制停止'")
+    print("   • 可以通过'检查端口'按钮查看端口实际状态")
+    print("   • 日志中的DEBUG信息已隐藏，只显示重要操作")
+    print("=" * 60)
+
+    logging.info("应用程序启动")
+
     root = tk.Tk()
+    logging.info("创建主窗口")
+
     app = MainWindow(root)
+    logging.info(
+        f"加载配置完成，共有 {len(app.saved_configs)} 个保存的配置和 {len(app.tags)} 个标签"
+    )
+
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    logging.info("应用程序界面就绪，等待用户操作...")
+
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        logging.info("收到键盘中断信号，正在退出...")
+        app.on_closing()
+    except Exception as e:
+        logging.error(f"应用程序运行时出错: {e}")
+        raise
+
