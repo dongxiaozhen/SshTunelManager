@@ -137,6 +137,10 @@ class CredentialsDialog:
 
 
 class SSHTunnel:
+    # paramiko 的 DEFAULT_MAX_PACKET_SIZE 就是 32768，按这个大小读可以让
+    # 一次 recv 正好填满一个 SSH 数据包，避免小缓冲带来的大量循环和 GIL 切换
+    BUFFER_SIZE = 32768
+
     def __init__(
         self,
         hostname,
@@ -178,6 +182,15 @@ class SSHTunnel:
 
                 client_socket, addr = self.server_socket.accept()
                 logging.debug(f"[{self.name}] 接受新连接: {addr}")
+
+                # MySQL 等请求-响应型协议是小包往返，Nagle 叠加 delayed ACK
+                # 会带来 40ms 级的停顿
+                try:
+                    client_socket.setsockopt(
+                        socket.IPPROTO_TCP, socket.TCP_NODELAY, 1
+                    )
+                except OSError as e:
+                    logging.debug(f"[{self.name}] 设置 TCP_NODELAY 失败: {e}")
 
                 if (
                     not self.ssh
@@ -252,13 +265,15 @@ class SSHTunnel:
 
                     if client_socket in r:
                         try:
-                            data = client_socket.recv(1024)
+                            data = client_socket.recv(self.BUFFER_SIZE)
                             if not data:
                                 logging.debug(
                                     f"[{self.name}] 客户端 {connection_id} 关闭连接"
                                 )
                                 break
-                            channel.send(data)
+                            # send() 可能只发出一部分，静默丢字节会让对端一直等
+                            # 一个凑不齐的包，必须用 sendall()
+                            channel.sendall(data)
                         except Exception as e:
                             logging.debug(
                                 f"[{self.name}] 从客户端读取数据失败 {connection_id}: {e}"
@@ -267,13 +282,13 @@ class SSHTunnel:
 
                     if channel in r:
                         try:
-                            data = channel.recv(1024)
+                            data = channel.recv(self.BUFFER_SIZE)
                             if not data:
                                 logging.debug(
                                     f"[{self.name}] SSH通道 {connection_id} 关闭"
                                 )
                                 break
-                            client_socket.send(data)
+                            client_socket.sendall(data)
                         except Exception as e:
                             logging.debug(
                                 f"[{self.name}] 从SSH通道读取数据失败 {connection_id}: {e}"
@@ -367,9 +382,14 @@ class SSHTunnel:
                         f"[{self.name}] 使用SSH配置连接: {username}@{connect_hostname}:{connect_port}"
                     )
 
+                    # 这三项 paramiko 默认都是 None，即无限等待：TCP 不通、
+                    # 服务端 banner 迟迟不来、认证被拖住，都会把线程永久挂住
                     connect_kwargs = {
                         "hostname": connect_hostname,
                         "port": connect_port,
+                        "timeout": 10,
+                        "banner_timeout": 15,
+                        "auth_timeout": 15,
                     }
 
                     if username:
@@ -377,6 +397,9 @@ class SSHTunnel:
 
                     if "identityfile" in host_config:
                         connect_kwargs["key_filename"] = host_config["identityfile"][0]
+                        # 已经指定了密钥，就不必再去挨个试 ~/.ssh/id_* ，
+                        # 每次失败的公钥认证都是一个往返
+                        connect_kwargs["look_for_keys"] = False
                         logging.info(
                             f"[{self.name}] 使用密钥文件: {host_config['identityfile'][0]}"
                         )
@@ -398,6 +421,13 @@ class SSHTunnel:
                         username=credentials["username"],
                         password=credentials["password"],
                         port=credentials["port"],
+                        # 用户明确给了密码，跳过公钥/agent 尝试，
+                        # 否则会先白跑一轮公钥认证，还可能撞上 MaxAuthTries
+                        look_for_keys=False,
+                        allow_agent=False,
+                        timeout=10,
+                        banner_timeout=15,
+                        auth_timeout=15,
                     )
             else:
                 logging.info(f"[{self.name}] SSH配置文件不存在，显示凭据对话框")
@@ -415,6 +445,11 @@ class SSHTunnel:
                     username=credentials["username"],
                     password=credentials["password"],
                     port=credentials["port"],
+                    look_for_keys=False,
+                    allow_agent=False,
+                    timeout=10,
+                    banner_timeout=15,
+                    auth_timeout=15,
                 )
 
             logging.info(f"[{self.name}] SSH连接成功，开始创建本地端口监听")
